@@ -4,3 +4,5 @@ pydantic
 python-dotenv
 supabase
 h11
+httpx
+gunicorn
