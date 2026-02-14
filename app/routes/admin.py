@@ -5,7 +5,7 @@ from datetime import datetime
 
 router = APIRouter()
 
-CEO_EMAIL = "pravallika@vriksha.ai"
+CEO_EMAIL = "vijay@vriksha.ai"
 
 def check_ceo(email: str):
     if email != CEO_EMAIL:

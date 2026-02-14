@@ -23,7 +23,7 @@ async def signup(user: UserCreate):
 async def login(user: UserLogin):
     print(f"Login attempt for: {user.email}")
     try:
-        CEO_EMAIL = "pravallika@vriksha.ai"
+        CEO_EMAIL = "vijay@vriksha.ai"
         
         # Try to sign in
         try:
