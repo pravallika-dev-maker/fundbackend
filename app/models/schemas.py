@@ -48,19 +48,27 @@ class InvestmentRequest(BaseModel):
 
 # Admin Update Schemas
 class ExpenseRequest(BaseModel):
+    title: str
     amount: float
+    category: str
+    phase: int
+    date: str  # ISO 8601 string
+    notes: Optional[str] = None
     email: str
 
 class GrowthRequest(BaseModel):
     amount: float
     email: str
+    date: Optional[str] = None
 
 class ProfitRequest(BaseModel):
     amount: float
     email: str
+    date: Optional[str] = None
 
 class PhaseProgressRequest(BaseModel):
     phase1: int
     phase2: int
     phase3: int
     email: str
+    date: Optional[str] = None
