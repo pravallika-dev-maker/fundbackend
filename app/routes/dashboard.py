@@ -93,6 +93,16 @@ async def get_metrics():
         # Calculate remaining target value based on current price
         metrics['remaining_target_value'] = metrics['total_stocks'] * metrics['stock_price']
         
+        # 5. Calculate Actual Capital Put In (Initial Capital)
+        try:
+            cap_res = supabase.table('activity_log')\
+                .select("amount")\
+                .filter('type', 'in', '("investment_made", "capital_added")')\
+                .execute()
+            metrics['total_capital'] = sum(float(item.get('amount', 0) or 0) for item in (cap_res.data or []))
+        except Exception:
+            metrics['total_capital'] = 0
+
         return metrics
     except Exception as e:
         print(f"Error fetching metrics: {e}")
@@ -122,9 +132,27 @@ async def get_allocation():
 @router.get("/expenses/analytics")
 async def get_expense_analytics():
     try:
-        response = supabase.table('expenses').select("*").order('date', desc=True).execute()
-        expenses = response.data if response.data else []
+        # Use activity_log as the Definitive Source of Truth for the Graph
+        response = supabase.table('activity_log')\
+            .select("*")\
+            .eq('type', 'expense_added')\
+            .order('created_at', desc=True)\
+            .execute()
         
+        raw_logs = response.data if response.data else []
+        
+        # Map activity_log fields to what the calculation utils expect
+        expenses = []
+        for log in raw_logs:
+            amt = float(log.get('amount', 0) or 0)
+            
+            expenses.append({
+                "date": log.get('created_at'),
+                "amount": amt,
+                "category": log.get('category') or 'Infrastructure', # Fallback for old logs
+                "phase": log.get('phase') or 1,                      # Fallback for old logs
+            })
+            
         return {
             "daily": get_daily_expenses(expenses),
             "monthly": get_monthly_expenses(expenses),
@@ -134,4 +162,37 @@ async def get_expense_analytics():
             "breakdown": get_monthly_category_breakdown(expenses)
         }
     except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/performance")
+async def get_performance_analytics():
+    try:
+        # 1. Fetch appreciation/profits from dedicated table
+        perf_response = supabase.table('fund_performance_history').select("*").order('date', desc=False).execute()
+        history = perf_response.data if perf_response.data else []
+        
+        # Adapt for utils
+        formatted = []
+        
+        # Add performance history
+        for item in history:
+            d = item.get('date')
+            if not d: continue
+            cat = "Land Growth" if item.get('type') == 'land_growth' else "Profit"
+            formatted.append({
+                "date": str(d), 
+                "amount": float(item.get('amount', 0)),
+                "category": cat
+            })
+            
+        # Sort by date to ensure breakdown is chronological
+        formatted.sort(key=lambda x: x['date'])
+            
+        return {
+            "breakdown": get_monthly_category_breakdown(formatted),
+            "total_land_growth": sum(x['amount'] for x in formatted if x['category'] == "Land Growth"),
+            "total_profit": sum(x['amount'] for x in formatted if x['category'] == "Profit")
+        }
+    except Exception as e:
+        print(f"Error fetching performance history: {e}")
         raise HTTPException(status_code=500, detail=str(e))

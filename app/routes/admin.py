@@ -55,7 +55,6 @@ async def update_fund_metrics(metrics: dict, custom_date: str = None):
     try:
         # Calculate new stock price
         total_val = float(metrics.get('total_fund_value', 0))
-        # Total Authorized Shares is fixed at 1000 effectively for valuation
         total_stocks_cap = 1000 
         metrics['stock_price'] = int(total_val / total_stocks_cap)
         
@@ -64,24 +63,28 @@ async def update_fund_metrics(metrics: dict, custom_date: str = None):
             investments_res = supabase.table('investments').select('stock_count').execute()
             total_sold = 0
             if investments_res.data:
-                total_sold = sum(item['stock_count'] for item in investments_res.data)
+                total_sold = sum(item.get('stock_count', 0) for item in investments_res.data)
             metrics['total_stocks'] = max(0, 1000 - total_sold)
         except Exception:
-            pass # Keep existing value if fetch fails
+            pass # Use whatever is in metrics
+            
         metrics['updated_at'] = datetime.utcnow().isoformat()
-        
-        if custom_date:
+        if custom_date and str(custom_date).strip():
             metrics['created_at'] = custom_date
             
-        # List of valid columns to prevent 'column does not exist' errors
-        VALID_COLUMNS = {
-            'total_fund_value', 'total_stocks', 'stock_price', 'growth_percentage',
-            'phase1_progress', 'phase2_progress', 'phase3_progress',
-            'land_value', 'total_profits', 'total_expenses', 'created_at', 'updated_at'
-        }
+        # 1. Self-Healing Schema Check: Get actual columns in the database
+        try:
+            schema_res = supabase.table('fund_metrics').select("*").limit(1).execute()
+            db_columns = schema_res.data[0].keys() if schema_res.data else []
+        except Exception:
+            # Fallback to a safe minimum if check fails
+            db_columns = ['total_fund_value', 'stock_price', 'total_stocks', 'created_at', 'updated_at']
+
+        # 2. Filter payload to ONLY include columns that actually exist in the DB
+        payload = {k: v for k, v in metrics.items() if (not db_columns or k in db_columns)}
         
-        # Filter metrics to only include valid columns
-        payload = {k: v for k, v in metrics.items() if k in VALID_COLUMNS}
+        # Safety: Remove id/sensitive if accidently included
+        payload.pop('id', None)
         
         res = supabase.table('fund_metrics').insert(payload).execute()
         return payload
@@ -94,41 +97,56 @@ async def add_expense(req: ExpenseRequest):
     try:
         check_ceo(req.email)
         
-        # 1. Insert into expenses table
-        # Pydantic v2 compatibility: use model_dump if available, else dict
-        expense_data = req.model_dump(exclude={"email"}) if hasattr(req, 'model_dump') else req.dict(exclude={"email"})
+        # Normalize date
+        effective_date = req.date if (req.date and req.date.strip()) else datetime.utcnow().isoformat()
         
-        data = supabase.table('expenses').insert(expense_data).execute()
+        # 1. Insert into expenses table
+        expense_data = req.model_dump(exclude={"email"}) if hasattr(req, 'model_dump') else req.dict(exclude={"email"})
+        expense_data['date'] = effective_date
+            
+        try:
+            # Self-healing schema filter for expenses table
+            try:
+                exp_schema_res = supabase.table('expenses').select("*").limit(1).execute()
+                exp_db_cols = exp_schema_res.data[0].keys() if exp_schema_res.data else []
+                if exp_db_cols:
+                    expense_data = {k: v for k, v in expense_data.items() if k in exp_db_cols}
+            except Exception:
+                pass # Try raw insert if check fails
+
+            supabase.table('expenses').insert(expense_data).execute()
+        except Exception as ee:
+            print(f"Warning: Failed to log to expenses table: {ee}")
         
         # 2. Update fund_metrics
         metrics = await get_current_metrics()
-        
-        # Remove 'id' and 'updated_at' if they exist to insert fresh (history pattern)
         metrics.pop('id', None)
         metrics.pop('updated_at', None)
         
-        # Ensure total_expenses is treated as a number
+        # Calculate new total expense
         current_expenses = float(metrics.get('total_expenses', 0) or 0)
         metrics['total_expenses'] = int(current_expenses + req.amount)
         
-        updated = await update_fund_metrics(metrics, req.date)
+        updated = await update_fund_metrics(metrics, effective_date)
         
-        # Log Activity
+        # 3. Log Activity (Single Source of Truth)
         log_entry = {
             "type": "expense_added",
             "amount": req.amount,
             "email": req.email,
-            "date": req.date or datetime.utcnow().date().isoformat()
+            "category": req.category,
+            "phase": req.phase,
+            "created_at": effective_date
         }
-        if req.date:
-            log_entry["created_at"] = req.date
-        
-        supabase.table('activity_log').insert(log_entry).execute()
+        try:
+            supabase.table('activity_log').insert(log_entry).execute()
+        except Exception as ae:
+            print(f"Warning: Activity log failed: {ae}")
         
         return updated
     except Exception as e:
-        print(f"Error in add-expense: {str(e)}") # Print to console for debugging
-        raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
+        print(f"Error in add-expense: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/update-growth")
 async def update_growth(req: GrowthRequest):
@@ -139,23 +157,39 @@ async def update_growth(req: GrowthRequest):
         metrics.pop('id', None)
         metrics.pop('updated_at', None)
         
-        # Update land value separately (DO NOT add to total_fund_value)
-        # Robustly handle potential None or string values from DB
+        # Normalize date
+        effective_date = req.date if (req.date and req.date.strip()) else datetime.utcnow().isoformat()
+        
+        # Update land value AND master total fund value (Valuation increases)
         current_land = float(metrics.get('land_value', 0) or 0)
         metrics['land_value'] = int(current_land + req.amount)
         
-        updated = await update_fund_metrics(metrics, req.date)
+        current_total = float(metrics.get('total_fund_value', 0) or 0)
+        metrics['total_fund_value'] = int(current_total + req.amount)
+        
+        updated = await update_fund_metrics(metrics, effective_date)
         
         # Standardized event type for financial timeline
         log_entry = {
             "type": "land_value_updated",
             "amount": req.amount,
-            "email": req.email
+            "email": req.email,
+            "created_at": effective_date
         }
-        if req.date:
-            log_entry["created_at"] = req.date
-
         supabase.table('activity_log').insert(log_entry).execute()
+
+        # NEW: Log to dedicated performance history table
+        try:
+            perf_entry = {
+                "type": "land_growth",
+                "amount": req.amount,
+                "date": effective_date.split('T')[0],
+                "updated_by": req.email,
+                "description": "Land value appreciation"
+            }
+            supabase.table('fund_performance_history').insert(perf_entry).execute()
+        except Exception as perf_err:
+             print(f"Warning: Could not log to fund_performance_history (Migration likely needed): {perf_err}")
         
         return updated
     except Exception as e:
@@ -171,23 +205,39 @@ async def add_profit(req: ProfitRequest):
         metrics.pop('id', None)
         metrics.pop('updated_at', None)
         
-        # Update profits separately
-        # Robustly handle potential None or string values from DB
+        # Normalize date
+        effective_date = req.date if (req.date and req.date.strip()) else datetime.utcnow().isoformat()
+        
+        # Update profits AND master total fund value (Valuation increases)
         current_profits = float(metrics.get('total_profits', 0) or 0)
         metrics['total_profits'] = int(current_profits + req.amount)
         
-        updated = await update_fund_metrics(metrics, req.date)
+        current_total = float(metrics.get('total_fund_value', 0) or 0)
+        metrics['total_fund_value'] = int(current_total + req.amount)
+        
+        updated = await update_fund_metrics(metrics, effective_date)
         
         # Standardized event type for financial timeline
         log_entry = {
             "type": "profit_added",
             "amount": req.amount,
-            "email": req.email
+            "email": req.email,
+            "created_at": effective_date
         }
-        if req.date:
-            log_entry["created_at"] = req.date
-
         supabase.table('activity_log').insert(log_entry).execute()
+
+        # NEW: Log to dedicated performance history table
+        try:
+            perf_entry = {
+                "type": "profit",
+                "amount": req.amount,
+                "date": effective_date.split('T')[0],
+                "updated_by": req.email,
+                "description": "Profit distribution/addition"
+            }
+            supabase.table('fund_performance_history').insert(perf_entry).execute()
+        except Exception as perf_err:
+             print(f"Warning: Could not log to fund_performance_history (Migration likely needed): {perf_err}")
         
         return updated
     except Exception as e:
@@ -203,20 +253,21 @@ async def update_phase(req: PhaseProgressRequest):
         metrics.pop('id', None)
         metrics.pop('updated_at', None)
         
+        # Normalize date
+        effective_date = req.date if (req.date and req.date.strip()) else datetime.utcnow().isoformat()
+        
         metrics['phase1_progress'] = req.phase1
         metrics['phase2_progress'] = req.phase2
         metrics['phase3_progress'] = req.phase3
         
-        updated = await update_fund_metrics(metrics, req.date)
+        updated = await update_fund_metrics(metrics, effective_date)
         
         log_entry = {
             "type": "progress_updated",
             "amount": 0,
-            "email": req.email
+            "email": req.email,
+            "created_at": effective_date
         }
-        if req.date:
-            log_entry["created_at"] = req.date
-
         supabase.table('activity_log').insert(log_entry).execute()
         
         return updated
