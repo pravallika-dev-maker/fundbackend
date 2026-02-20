@@ -42,14 +42,13 @@ def get_phase_wise_expenses(expenses: List[Dict[str, Any]]) -> List[Dict[str, An
         
     return [{"label": k, "total": v} for k, v in sorted(grouped.items())]
 
-def get_category_wise_expenses(expenses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def get_category_wise_expenses(expenses: List[Dict[str, Any]]) -> Dict[str, float]:
     """Group by category and sum amount."""
     grouped = defaultdict(float)
     for exp in expenses:
         cat = exp['category']
         grouped[cat] += float(exp['amount'])
-        
-    return [{"label": k, "total": v} for k, v in sorted(grouped.items())]
+    return dict(grouped)
 
 def get_monthly_category_breakdown(expenses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """

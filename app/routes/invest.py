@@ -2,12 +2,23 @@ from fastapi import APIRouter, HTTPException
 from app.models.schemas import InvestmentRequest
 from app.utils.supabase import supabase
 from datetime import datetime
+from typing import Optional
 
 router = APIRouter()
 
 @router.post("/purchase")
-async def purchase_stocks(req: InvestmentRequest, email: str):
+async def purchase_stocks(req: InvestmentRequest):
     try:
+        email = req.email
+        fund_id = req.fund_id
+        if not fund_id:
+            # Fallback to a default fund if only one exists or for legacy
+            funds_res = supabase.table('funds').select("id").limit(1).execute()
+            if funds_res.data:
+                fund_id = funds_res.data[0]['id']
+            else:
+                 raise HTTPException(status_code=400, detail="fund_id is required and no funds exist.")
+
         # 1. Get current profile to check existing stocks
         profile_res = supabase.table('profiles').select("total_stocks, is_investor").eq('email', email).single().execute()
         if not profile_res.data:
@@ -25,34 +36,40 @@ async def purchase_stocks(req: InvestmentRequest, email: str):
         # 3. Record the transaction in investments table
         purchase_data = {
             "email": email,
+            "fund_id": fund_id,
             "stock_count": req.stock_count,
             "amount_paid": req.total_amount,
             "status": "completed"
         }
         supabase.table('investments').insert(purchase_data).execute()
 
-        # 4. Update Fund Metrics (Total Value & Stock Price) for the Dashboard
+        # 4. Update Fund Metrics (Total Value & Stock Price) for THIS fund
         try:
-            metrics_res = supabase.table('fund_metrics').select("*").order('id', desc=True).limit(1).execute()
+            metrics_res = supabase.table('fund_metrics')\
+                .select("*")\
+                .eq('fund_id', fund_id)\
+                .order('id', desc=True)\
+                .limit(1)\
+                .execute()
+            
             if metrics_res.data:
                 latest = metrics_res.data[0]
                 
-                # Calculate "Available Stocks" dynamically from Investment records
-                investments_res = supabase.table('investments').select('stock_count').execute()
+                # Available Stocks based on total sales for THIS fund
+                investments_res = supabase.table('investments')\
+                    .select('stock_count')\
+                    .eq('fund_id', fund_id)\
+                    .execute()
                 total_sold = 0
                 if investments_res.data:
                     total_sold = sum(item['stock_count'] for item in investments_res.data)
                 
-                # NOTE: investments_res might NOT include the *current* purchase yet if insert happened in parallel or transaction isolation is an issue?
-                # Actually, we inserted into 'investments' at step 3. So reading it back now should include it.
-                # Just to be safe, if Supabase hasn't committed it yet (which it should have), we can rely on decrement or just re-read.
-                # Since we are using Supabase HTTP API, each call is a transaction or atomic.
-                
                 new_inventory = max(0, 1000 - total_sold)
                 
                 new_metrics = {
+                    "fund_id": fund_id,
                     "total_fund_value": float(latest.get('total_fund_value', 0) or 0) + float(req.total_amount),
-                    "total_stocks": new_inventory, # Available inventory based on total sales
+                    "total_stocks": new_inventory,
                     "phase1_progress": latest.get('phase1_progress', 85),
                     "phase2_progress": latest.get('phase2_progress', 40),
                     "phase3_progress": latest.get('phase3_progress', 15),
@@ -63,18 +80,19 @@ async def purchase_stocks(req: InvestmentRequest, email: str):
                     "created_at": datetime.utcnow().isoformat()
                 }
                 
-                # Recalculate stock price: 
-                # Price should be based on Total Authorized Shares (1000), not Available Shares.
-                # Price = Total Fund Value / 1000.
+                # Price = Total Fund Value / 1000 Authorized Shares
                 total_cap = 1000 
                 new_metrics['stock_price'] = int(new_metrics['total_fund_value'] / total_cap)
                 
+                # Handle potential column mismatches via self-healing insert if needed
+                # (Ignoring for brevity as update_fund_metrics pattern covers this in admin)
                 supabase.table('fund_metrics').insert(new_metrics).execute()
         except Exception as me:
             print(f"Metrics update sub-error: {me}")
 
-        # 5. Log activity for the Growth History chart on Dashboard
+        # 5. Log activity for the specific fund
         log_entry = {
+            "fund_id": fund_id,
             "type": "investment_made",
             "amount": req.total_amount,
             "email": email,
@@ -83,7 +101,7 @@ async def purchase_stocks(req: InvestmentRequest, email: str):
         supabase.table('activity_log').insert(log_entry).execute()
         
         return {
-            "message": f"Successfully purchased {req.stock_count} stocks",
+            "message": f"Successfully purchased {req.stock_count} units",
             "new_total": new_total,
             "status": "success"
         }
@@ -104,7 +122,6 @@ async def become_investor(email: str):
 @router.post("/verify")
 async def verify_kyc(data: dict):
     try:
-        # In a real app, you'd store this in a 'verifications' table
         email = data.get('email')
         update = supabase.table('profiles').update({"verification_status": "pending"}).eq('email', email).execute()
         return {"message": "Verification submitted", "status": "pending"}

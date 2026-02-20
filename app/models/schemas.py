@@ -33,9 +33,9 @@ class FundMetrics(BaseModel):
     total_stocks: int
     stock_price: int
     growth_percentage: float
-    phase1_progress: Optional[int] = 85
-    phase2_progress: Optional[int] = 40
-    phase3_progress: Optional[int] = 15
+    phase1_progress: Optional[int] = 0
+    phase2_progress: Optional[int] = 0
+    phase3_progress: Optional[int] = 0
 
 class AllocationItem(BaseModel):
     name: str
@@ -45,6 +45,8 @@ class AllocationItem(BaseModel):
 class InvestmentRequest(BaseModel):
     stock_count: int
     total_amount: int
+    email: str
+    fund_id: Optional[str] = None
 
 # Admin Update Schemas
 class ExpenseRequest(BaseModel):
@@ -52,19 +54,22 @@ class ExpenseRequest(BaseModel):
     amount: float
     category: str
     phase: int
-    date: str  # ISO 8601 string
+    date: Optional[str] = None
     notes: Optional[str] = None
     email: str
+    fund_id: str
 
 class GrowthRequest(BaseModel):
     amount: float
     email: str
     date: Optional[str] = None
+    fund_id: str
 
 class ProfitRequest(BaseModel):
     amount: float
     email: str
     date: Optional[str] = None
+    fund_id: str
 
 class PhaseProgressRequest(BaseModel):
     phase1: int
@@ -72,3 +77,26 @@ class PhaseProgressRequest(BaseModel):
     phase3: int
     email: str
     date: Optional[str] = None
+    fund_id: str
+
+class RoadmapStep(BaseModel):
+    phase: str
+    date: str
+    status: str
+
+class RoadmapUpdateRequest(BaseModel):
+    roadmap: List[RoadmapStep]
+    email: str
+    fund_id: str
+
+class FundDatesUpdateRequest(BaseModel):
+    entry_date: str
+    exit_date: str
+    p1_start_date: Optional[str] = None
+    p1_end_date: Optional[str] = None
+    p2_start_date: Optional[str] = None
+    p2_end_date: Optional[str] = None
+    p3_start_date: Optional[str] = None
+    p3_end_date: Optional[str] = None
+    email: str
+    fund_id: str
