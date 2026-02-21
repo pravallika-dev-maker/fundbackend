@@ -86,7 +86,17 @@ async def purchase_stocks(req: InvestmentRequest):
                 
                 # Handle potential column mismatches via self-healing insert if needed
                 # (Ignoring for brevity as update_fund_metrics pattern covers this in admin)
+                # available column updates
                 supabase.table('fund_metrics').insert(new_metrics).execute()
+
+                # 4.1 Sync fund_stocks table (Legacy tracking used by some frontend views)
+                try:
+                    supabase.table('fund_stocks').update({
+                        "stocks_sold": total_sold,
+                        "stocks_available": new_inventory
+                    }).eq('fund_id', fund_id).execute()
+                except Exception as fe:
+                    print(f"Warning: could not sync legacy fund_stocks: {fe}")
         except Exception as me:
             print(f"Metrics update sub-error: {me}")
 

@@ -80,14 +80,77 @@ async def login(user: UserLogin):
         
         if not profile_data:
             print("Profile missing, creating one...")
-            new_profile = {
-                "id": res.user.id,
-                "email": res.user.email,
-                "is_investor": False,
-                "verification_status": "none"
-            }
-            profile_res = supabase.table('profiles').insert(new_profile).execute()
-            profile_data = profile_res.data[0]
+            
+            # Try to check fund_managers table for role assignment
+            role = "investor"
+            assigned_fund = None
+            try:
+                manager_check = supabase.table('fund_managers').select('*').eq('email', res.user.email).execute()
+                if manager_check.data:
+                    role = "fund_manager"
+                    assigned_fund = manager_check.data[0].get('assigned_fund')
+            except Exception as mc_err:
+                print(f"Warning: fund_managers check failed: {mc_err}")
+            
+            # Try inserting full profile with role + assigned_fund
+            try:
+                new_profile = {
+                    "id": res.user.id,
+                    "email": res.user.email,
+                    "is_investor": False,
+                    "verification_status": "none",
+                    "role": role,
+                    "assigned_fund": assigned_fund
+                }
+                profile_res = supabase.table('profiles').insert(new_profile).execute()
+                profile_data = profile_res.data[0]
+            except Exception as insert_err:
+                print(f"Warning: Full profile insert failed ({insert_err}), trying without role/assigned_fund...")
+                # Fallback: insert without the new columns if they don't exist yet
+                try:
+                    basic_profile = {
+                        "id": res.user.id,
+                        "email": res.user.email,
+                        "is_investor": False,
+                        "verification_status": "none",
+                    }
+                    profile_res = supabase.table('profiles').insert(basic_profile).execute()
+                    profile_data = profile_res.data[0]
+                    # Inject role data into the returned dict even if not stored
+                    profile_data["role"] = role
+                    profile_data["assigned_fund"] = assigned_fund
+                except Exception as basic_err:
+                    print(f"Error: Basic profile insert also failed: {basic_err}")
+                    profile_data = {
+                        "id": res.user.id,
+                        "email": res.user.email,
+                        "is_investor": False,
+                        "verification_status": "none",
+                        "role": role,
+                        "assigned_fund": assigned_fund
+                    }
+        else:
+            # If profile exists, try to sync fund_manager role
+            if profile_data.get('role') != 'ceo' and res.user.email != CEO_EMAIL:
+                try:
+                    manager_check = supabase.table('fund_managers').select('*').eq('email', res.user.email).execute()
+                    if manager_check.data:
+                        new_role = "fund_manager"
+                        assigned_fund = manager_check.data[0].get('assigned_fund')
+                        current_role = profile_data.get('role')
+                        
+                        if current_role != new_role or profile_data.get('assigned_fund') != assigned_fund:
+                            try:
+                                updates = {"role": new_role, "assigned_fund": assigned_fund}
+                                supabase.table('profiles').update(updates).eq('id', res.user.id).execute()
+                                profile_data.update(updates)
+                            except Exception as upd_err:
+                                print(f"Warning: Could not update role/assigned_fund in profiles ({upd_err}). Columns may not exist yet.")
+                                # Still inject into the return value so frontend works
+                                profile_data["role"] = new_role
+                                profile_data["assigned_fund"] = assigned_fund
+                except Exception as mc_err:
+                    print(f"Warning: fund_managers sync check failed: {mc_err}")
 
         return profile_data
 

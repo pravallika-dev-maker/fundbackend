@@ -13,8 +13,91 @@ router = APIRouter()
 @router.get("/funds")
 async def list_funds():
     try:
+        # 1. Fetch all funds
         res = supabase.table('funds').select("*").execute()
-        return res.data
+        funds = res.data
+        
+        # 2. Enrich with live investment and valuation data
+        for fund in funds:
+            fid = fund['id']
+            target_amount = float(fund.get('target_amount') or 0)
+            
+            # A. Live Investment Stats
+            inv_res = supabase.table('investments').select('stock_count, amount_paid').eq('fund_id', fid).execute()
+            total_sold = 0
+            actual_raised = 0
+            if inv_res.data:
+                total_sold = sum(item.get('stock_count', 0) for item in inv_res.data)
+                actual_raised = sum(float(item.get('amount_paid', 0) or 0) for item in inv_res.data)
+            
+            # B. Valuation Stats (Land Growth + Profits)
+            # Fetch latest snapshot to get land_value and total_profits
+            metrics_res = supabase.table('fund_metrics').select('land_value, total_profits, total_stocks')\
+                .eq('fund_id', fid).order('id', desc=True).limit(1).execute()
+            
+            land_val = 0
+            profits = 0
+            capacity = fund.get('total_stocks') or 1000
+            
+            if metrics_res.data:
+                m = metrics_res.data[0]
+                land_val = float(m.get('land_value') or 0)
+                profits = float(m.get('total_profits') or 0)
+                capacity = m.get('total_stocks') or capacity
+
+            # Total Fund Value = Target + Land Appreciation + Profits
+            total_fund_value = target_amount + land_val + profits
+            
+            # Stock Price = Total Value / Capacity
+            # Ensure we use int() for clean display as in /metrics endpoint
+            current_stock_price = int(total_fund_value / capacity) if capacity > 0 else fund.get('stock_price', 0)
+            
+            # C. ARR Timeline Calculation (Year 0 -> Year 5)
+            # Use specific ARR history if provided by CEO, fallback to calculated growth
+            arr_res = supabase.table('fund_arr_history').select('year_label, growth_rate')\
+                .eq('fund_id', fid).order('year_label', desc=False).execute()
+            
+            if arr_res.data:
+                # Map specific year labels
+                timeline = [{"year": "Y0", "growth": 0}]
+                arr_map = {item['year_label']: item['growth_rate'] for item in arr_res.data}
+                for i in range(1, 6):
+                    label = f"Y{i}"
+                    timeline.append({"year": label, "growth": arr_map.get(label, 0)})
+            else:
+                # Fallback to historical growth calculation if no specific ARR points exist
+                history_res = supabase.table('fund_metrics').select('land_value, total_profits, created_at')\
+                    .eq('fund_id', fid).order('created_at', desc=False).execute()
+                
+                timeline = [{"year": "Y0", "growth": 0}]
+                if history_res.data:
+                    latest_growth_pct = round((land_val + profits) / target_amount * 100, 2) if target_amount > 0 else 0
+                    for i in range(1, 6):
+                        if len(history_res.data) > i:
+                            h = history_res.data[i]
+                            h_growth = (float(h.get('land_value') or 0) + float(h.get('total_profits') or 0))
+                            pct = round((h_growth / target_amount) * 100, 2) if target_amount > 0 else 0
+                            timeline.append({"year": f"Y{i}", "growth": pct})
+                        elif i == 1:
+                             timeline.append({"year": f"Y{i}", "growth": latest_growth_pct})
+                        else:
+                            timeline.append({"year": f"Y{i}", "growth": latest_growth_pct})
+                else:
+                    for i in range(1, 6):
+                        timeline.append({"year": f"Y{i}", "growth": 0})
+            
+            # Attach for frontend consumption
+            fund['stocks_sold'] = total_sold
+            fund['stocks_available'] = max(0, capacity - total_sold)
+            fund['total_raised_capital'] = actual_raised
+            fund['stock_price'] = current_stock_price
+            fund['total_fund_value'] = total_fund_value
+            fund['arr_timeline'] = timeline
+            
+            # Add a progress field for easy access
+            fund['progress_percentage'] = round((total_sold / capacity) * 100, 2) if capacity > 0 else 0
+            
+        return funds
     except Exception as e:
         print(f"Error listing funds: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -103,6 +186,40 @@ async def get_metrics(fundId: Optional[str] = None):
 
         # 6. Area Info (Fallback if missing in table)
         metrics['total_area'] = fund.get('total_area', "12.5 Acres")
+
+        # 7. ARR Timeline Calculation (Year 0 -> Year 5)
+        # Use specific ARR history if provided by CEO, fallback to calculated growth
+        arr_res = supabase.table('fund_arr_history').select('year_label, growth_rate')\
+            .eq('fund_id', fund_id).order('year_label', desc=False).execute()
+        
+        if arr_res.data:
+            timeline = [{"year": "Y0", "growth": 0}]
+            arr_map = {item['year_label']: item['growth_rate'] for item in arr_res.data}
+            for i in range(1, 6):
+                label = f"Y{i}"
+                timeline.append({"year": label, "growth": arr_map.get(label, 0)})
+        else:
+            history_res = supabase.table('fund_metrics').select('land_value, total_profits, created_at')\
+                .eq('fund_id', fund_id).order('created_at', desc=False).execute()
+            
+            timeline = [{"year": "Y0", "growth": 0}]
+            if history_res.data:
+                latest_growth_pct = round((metrics['land_value'] + metrics['total_profits']) / metrics['total_capital'] * 100, 2) if metrics['total_capital'] > 0 else 0
+                for i in range(1, 6):
+                    if len(history_res.data) > i:
+                        h = history_res.data[i]
+                        h_growth = (float(h.get('land_value') or 0) + float(h.get('total_profits') or 0))
+                        pct = round((h_growth / metrics['total_capital']) * 100, 2) if metrics['total_capital'] > 0 else 0
+                        timeline.append({"year": f"Y{i}", "growth": pct})
+                    elif i == 1:
+                         timeline.append({"year": f"Y{i}", "growth": latest_growth_pct})
+                    else:
+                        timeline.append({"year": f"Y{i}", "growth": latest_growth_pct})
+            else:
+                for i in range(1, 6):
+                    timeline.append({"year": f"Y{i}", "growth": 0})
+        
+        metrics['arr_timeline'] = timeline
 
         return metrics
     except Exception as e:

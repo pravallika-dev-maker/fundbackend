@@ -79,6 +79,15 @@ class PhaseProgressRequest(BaseModel):
     date: Optional[str] = None
     fund_id: str
 
+class ARRItem(BaseModel):
+    year: str
+    growth_rate: float
+
+class ARRBulkUpdateRequest(BaseModel):
+    updates: List[ARRItem]
+    email: str
+    fund_id: str
+
 class RoadmapStep(BaseModel):
     phase: str
     date: str
@@ -100,3 +109,24 @@ class FundDatesUpdateRequest(BaseModel):
     p3_end_date: Optional[str] = None
     email: str
     fund_id: str
+
+class ManagerCreateRequest(BaseModel):
+    name: str
+    email: str
+    phone: str
+    assigned_fund: Optional[str] = None
+    ceo_email: str
+
+class FundCreateRequest(BaseModel):
+    name: str
+    location: str
+    target_amount: float
+    total_stocks: int
+    stock_price: float
+    entry_date: str
+    exit_date: str
+    phase: str
+    land_value: Optional[float] = 0
+    description: Optional[str] = None
+    blueprint_url: Optional[str] = None
+    ceo_email: str

@@ -1,5 +1,9 @@
 from fastapi import APIRouter, HTTPException
-from app.models.schemas import ExpenseRequest, GrowthRequest, ProfitRequest, PhaseProgressRequest, RoadmapUpdateRequest, FundDatesUpdateRequest
+from app.models.schemas import (
+    ExpenseRequest, GrowthRequest, ProfitRequest, PhaseProgressRequest, 
+    RoadmapUpdateRequest, FundDatesUpdateRequest, ARRBulkUpdateRequest,
+    ManagerCreateRequest, FundCreateRequest
+)
 from app.utils.supabase import supabase
 from datetime import datetime
 from typing import Optional
@@ -11,6 +15,23 @@ CEO_EMAIL = "vijay@vriksha.ai"
 def check_ceo(email: str):
     if email != CEO_EMAIL:
         raise HTTPException(status_code=403, detail="Only the Administrator can perform this action.")
+
+def check_authorized(email: str, fund_id: str = None):
+    """Allow CEO (all funds) or a fund manager (their assigned fund only)."""
+    if email == CEO_EMAIL:
+        return  # CEO has full access
+    # Check if this is a fund manager assigned to the given fund
+    try:
+        manager_res = supabase.table('fund_managers').select('assigned_fund').eq('email', email).execute()
+        if manager_res.data:
+            assigned = manager_res.data[0].get('assigned_fund')
+            if fund_id and assigned == fund_id:
+                return  # Manager is authorized for this fund
+            elif not fund_id:
+                return  # No fund restriction, manager can proceed
+    except Exception:
+        pass
+    raise HTTPException(status_code=403, detail="Only the Administrator or the assigned Fund Manager can perform this action.")
 
 async def get_current_metrics(fund_id: str):
     defaults = {
@@ -143,7 +164,7 @@ async def update_fund_metrics(metrics: dict, custom_date: str = None):
 @router.post("/add-expense")
 async def add_expense(req: ExpenseRequest):
     try:
-        check_ceo(req.email)
+        check_authorized(req.email, req.fund_id)
         effective_date = req.date if (req.date and req.date.strip()) else datetime.utcnow().isoformat()
         
         # 1. Insert into expenses table
@@ -192,7 +213,7 @@ async def add_expense(req: ExpenseRequest):
 @router.post("/update-growth")
 async def update_growth(req: GrowthRequest):
     try:
-        check_ceo(req.email)
+        check_authorized(req.email, req.fund_id)
         metrics = await get_current_metrics(req.fund_id)
         
         metrics.pop('id', None)
@@ -236,7 +257,7 @@ async def update_growth(req: GrowthRequest):
 @router.post("/add-profit")
 async def add_profit(req: ProfitRequest):
     try:
-        check_ceo(req.email)
+        check_authorized(req.email, req.fund_id)
         metrics = await get_current_metrics(req.fund_id)
         
         metrics.pop('id', None)
@@ -280,7 +301,7 @@ async def add_profit(req: ProfitRequest):
 @router.post("/update-phase")
 async def update_phase(req: PhaseProgressRequest):
     try:
-        check_ceo(req.email)
+        check_authorized(req.email, req.fund_id)
         metrics = await get_current_metrics(req.fund_id)
         
         metrics.pop('id', None)
@@ -307,10 +328,58 @@ async def update_phase(req: PhaseProgressRequest):
         print(f"Error in update-phase: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Server Error: {str(e)}")
 
+@router.post("/update-arr")
+async def update_arr(req: ARRBulkUpdateRequest):
+    try:
+        check_authorized(req.email, req.fund_id)
+        
+        results = []
+        for update in req.updates:
+            # We store these in a dedicated table for the 5-year growth timeline
+            entry = {
+                "fund_id": req.fund_id,
+                "year_label": update.year,
+                "growth_rate": update.growth_rate,
+                "updated_by": req.email,
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            
+            # Check if record for this year already exists for this fund to update instead of insert
+            existing = supabase.table('fund_arr_history')\
+                .select("*")\
+                .eq('fund_id', req.fund_id)\
+                .eq('year_label', update.year)\
+                .execute()
+                
+            if existing.data:
+                res = supabase.table('fund_arr_history')\
+                    .update({"growth_rate": update.growth_rate, "updated_at": datetime.utcnow().isoformat()})\
+                    .eq('fund_id', req.fund_id)\
+                    .eq('year_label', update.year)\
+                    .execute()
+            else:
+                res = supabase.table('fund_arr_history').insert(entry).execute()
+            results.append(res.data)
+            
+        # Log to activity log
+        log_entry = {
+            "fund_id": req.fund_id,
+            "type": "arr_updated_bulk",
+            "amount": len(req.updates),
+            "email": req.email,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        supabase.table('activity_log').insert(log_entry).execute()
+        
+        return results
+    except Exception as e:
+        print(f"Error in update-arr: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database sync failed: {str(e)}")
+
 @router.post("/update-roadmap")
 async def update_roadmap(req: RoadmapUpdateRequest):
     try:
-        check_ceo(req.email)
+        check_authorized(req.email, req.fund_id)
         roadmap_json = [step.model_dump() for step in req.roadmap]
         
         res = supabase.table('funds').update({"roadmap": roadmap_json}).eq('id', req.fund_id).execute()
@@ -332,7 +401,7 @@ async def update_roadmap(req: RoadmapUpdateRequest):
 @router.post("/update-fund-dates")
 async def update_fund_dates(req: FundDatesUpdateRequest):
     try:
-        check_ceo(req.email)
+        check_authorized(req.email, req.fund_id)
         
         update_data = {
             "entry_date": req.entry_date,
@@ -372,12 +441,38 @@ async def get_activities(fundId: Optional[str] = None):
 @router.get("/growth-history")
 async def get_fund_history(fundId: Optional[str] = None):
     try:
-        # Get fund start date first
+        # Get fund start date and target amount first
+        start_date = "2024-01-01"
+        target_amount = 26500000.0  # Default fallback
+        if fundId:
+            # If fundId is a slug (not a UUID), resolve it first
+            import re
+            is_uuid = re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', str(fundId).lower())
+            
+            if not is_uuid:
+                # Search by name-based slug if we don't have a slug column
+                # Standard practice: find the fund that matches the name when slugified
+                funds_res = supabase.table('funds').select("id, name").execute()
+                found_id = None
+                for f in (funds_res.data or []):
+                    f_slug = f['name'].lower().replace(' ', '-')
+                    if f_slug == str(fundId).lower():
+                        found_id = f['id']
+                        break
+                if found_id:
+                    fundId = found_id
+                else:
+                    # Fallback or error
+                    pass
+
+        # 1. Fetch Fund Details
+        target_amount = 26500000.0
         start_date = "2024-01-01"
         if fundId:
-            fund_res = supabase.table('funds').select('created_at').eq('id', fundId).execute()
-            if fund_res.data:
-                start_date = fund_res.data[0]['created_at'].split('T')[0]
+            f_detail = supabase.table('funds').select("created_at, target_amount").eq('id', fundId).execute()
+            if f_detail.data:
+                start_date = f_detail.data[0]['created_at'].split('T')[0]
+                target_amount = float(f_detail.data[0].get('target_amount') or 26500000)
 
         query = supabase.table('activity_log').select("*").order('created_at', desc=False)
         if fundId:
@@ -401,7 +496,8 @@ async def get_fund_history(fundId: Optional[str] = None):
             "capital": 0,
             "deployment": 0,
             "fundValue": 0,
-            "total": 0
+            "total": 0,
+            "progress": 0
         }
 
         running_land = 0
@@ -433,15 +529,22 @@ async def get_fund_history(fundId: Optional[str] = None):
                 timestamp = item.get('created_at', '')
                 date_key = timestamp.split('T')[0] if 'T' in timestamp else timestamp[:10]
                 
+                # Calculate progress percentage (Raised / Target)
+                prog_val = min(100, int((running_capital / target_amount) * 100)) if target_amount > 0 else 0
+                
                 # Cumulative update
+                # Valuation = Invested Capital + Land Growth + Realized Profits
+                current_valuation = running_capital + running_land + running_profits
+
                 history_map[date_key] = {
                     "date": date_key,
                     "landAppreciation": running_land,
                     "profits": running_profits,
                     "capital": running_capital,
-                    "deployment": running_expenses,
-                    "fundValue": running_land + running_profits + running_capital,
-                    "total": running_land + running_profits + running_capital
+                    "deployment": running_expenses, # Deployment = Actual Expenses spent
+                    "fundValue": current_valuation,
+                    "total": current_valuation,
+                    "progress": prog_val
                 }
             
         sorted_history = [history_map[k] for k in sorted(history_map.keys())]
@@ -449,3 +552,69 @@ async def get_fund_history(fundId: Optional[str] = None):
     except Exception as e:
         print(f"Error in growth history: {e}")
         return []
+
+@router.post("/create-manager")
+async def create_manager(req: ManagerCreateRequest):
+    try:
+        check_ceo(req.ceo_email)
+        
+        manager_data = {
+            "name": req.name,
+            "email": req.email,
+            "phone": req.phone,
+            "assigned_fund": req.assigned_fund,
+            "created_by_ceo": req.ceo_email,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Save to fund_managers table
+        res = supabase.table('fund_managers').insert(manager_data).execute()
+        
+        # Update user role to fund_manager in profiles table if it exists
+        supabase.table('profiles').update({"role": "fund_manager"}).eq('email', req.email).execute()
+        
+        return {"status": "success", "data": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/create-fund")
+async def create_fund(req: FundCreateRequest):
+    try:
+        check_ceo(req.ceo_email)
+        
+        fund_data = {
+            "name": req.name,
+            "location": req.location,
+            "target_amount": req.target_amount,
+            "total_stocks": req.total_stocks,
+            "stock_price": req.stock_price,
+            "entry_date": req.entry_date,
+            "exit_date": req.exit_date,
+            "phase": req.phase,
+            "description": req.description,
+            "blueprint_url": req.blueprint_url,
+            "created_by_ceo": req.ceo_email,
+            "created_at": datetime.utcnow().isoformat()
+        }
+        
+        # Save to funds table
+        res = supabase.table('funds').insert(fund_data).execute()
+        
+        if res.data:
+            new_fund_id = res.data[0]['id']
+            # Initialize metrics for the new fund
+            metrics_data = {
+                "fund_id": new_fund_id,
+                "land_value": req.land_value or 0,
+                "total_profits": 0,
+                "phase1_progress": 0,
+                "phase2_progress": 0,
+                "phase3_progress": 0,
+                "total_stocks": req.total_stocks,
+                "created_at": datetime.utcnow().isoformat()
+            }
+            supabase.table('fund_metrics').insert(metrics_data).execute()
+            
+        return {"status": "success", "data": res.data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
